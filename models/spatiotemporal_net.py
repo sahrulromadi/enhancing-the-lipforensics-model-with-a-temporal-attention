@@ -40,11 +40,12 @@ def get_model(weights_forgery_path=None, device="cuda:0"):
 
     # load weights learned during face forgery detection
     if weights_forgery_path is not None:
-        checkpoint_dict = torch.load(weights_forgery_path, map_location=lambda storage, loc: storage.cuda(device))
-        model.load_state_dict(checkpoint_dict["model"])
-        print("Face forgery weights loaded.")
+        # Kita sekarang bisa langsung menggunakan parameter 'device'
+        checkpoint_dict = torch.load(weights_forgery_path, map_location=device)
+        model.load_state_dict(checkpoint_dict["model"], strict=False)
+        print(f"Face forgery weights loaded onto {device}.")
     else:
-        print("Randomly initialised weights.")
+        print("Randomly initialised weights.")  
 
     model.to(device)
     return model
@@ -70,14 +71,41 @@ class MultiscaleMultibranchTCN(nn.Module):
         self.mb_ms_tcn = MultibranchTemporalConvNet(
             input_size, num_channels, tcn_options, dropout=dropout, relu_type=relu_type, dwpw=dwpw
         )
+
+        # Definisikan jaringan kecil untuk menghitung skor atensi
+        self.attention_net = nn.Sequential(
+            nn.Linear(num_channels[-1], 128),  # Ambil fitur frame dari TCN
+            nn.Tanh(),                         # Fungsi aktivasi
+            nn.Linear(128, 1)                  # Hasilkan satu skor untuk setiap frame
+        )
+
         self.tcn_output = nn.Linear(num_channels[-1], num_classes)
-        self.consensus_func = _average_batch
 
     def forward(self, x, lengths):
+        # x memiliki shape: (batch_size, sequence_length, feature_dim)
         x = x.transpose(1, 2)
-        out = self.mb_ms_tcn(x)
-        out = self.consensus_func(out, lengths)
-        return self.tcn_output(out)
+        # tcn_output memiliki shape: (batch_size, feature_dim, sequence_length)
+        tcn_output = self.mb_ms_tcn(x)
+        
+        # Ubah kembali shape agar sesuai untuk lapisan atensi
+        tcn_output = tcn_output.transpose(1, 2) # Shape: (batch_size, sequence_length, feature_dim)
+
+        # 1. Hitung skor atensi untuk setiap frame
+        # attention_scores shape: (batch_size, sequence_length, 1)
+        attention_scores = self.attention_net(tcn_output)
+        
+        # 2. Normalisasi skor menjadi bobot atensi menggunakan softmax
+        # attention_weights shape: (batch_size, sequence_length, 1)
+        attention_weights = torch.softmax(attention_scores, dim=1)
+        
+        # 3. Hitung rata-rata yang dibobotkan (weighted average)
+        # Kalikan setiap fitur frame dengan bobot atensinya
+        weighted_features = tcn_output * attention_weights
+        # Jumlahkan semua fitur yang telah dibobotkan untuk mendapatkan satu vektor representasi
+        context_vector = torch.sum(weighted_features, dim=1) # Shape: (batch_size, feature_dim)
+
+        # 4. Masukkan ke lapisan klasifikasi akhir
+        return self.tcn_output(context_vector)
 
 
 class Lipreading(nn.Module):
